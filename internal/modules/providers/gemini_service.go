@@ -777,7 +777,13 @@ func (c *Client) generateContent(ctx context.Context, prompt string, metadata []
 			return nil, lastErr
 		}
 
-		respBytes, err := io.ReadAll(httpResp.Body)
+		var respBytes []byte
+		if config.Video != nil || config.Music != nil {
+			// Media jobs already poll the conversation after the acknowledgement.
+			respBytes, err = io.ReadAll(httpResp.Body)
+		} else {
+			respBytes, err = c.readGenerateStream(ctx, httpResp.Body)
+		}
 		_ = httpResp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("failed to read generate response: %w", err)

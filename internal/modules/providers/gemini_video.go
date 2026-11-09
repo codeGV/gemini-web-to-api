@@ -399,11 +399,22 @@ func (c *Client) readConversationVideos(ctx context.Context, conversationID stri
 
 // readConversationCandidates reads the newest reply's candidates (hNvQHb).
 func (c *Client) readConversationCandidates(ctx context.Context, conversationID string) ([][]interface{}, string, error) {
+	body, err := c.readConversationBody(ctx, conversationID)
+	if err != nil {
+		return nil, "", err
+	}
+	candidates, text := parseConversationCandidates(body)
+	return candidates, text, nil
+}
+
+// readConversationBody returns the raw batchexecute hNvQHb response holding the
+// latest turns of a conversation, newest first.
+func (c *Client) readConversationBody(ctx context.Context, conversationID string) ([]byte, error) {
 	c.mu.RLock()
 	token, cookieHeader, buildLabel, sessionID, language, authUser, generationID := c.at, c.cookieHeader, c.buildLabel, c.sessionID, c.language, c.authUser, c.generationID
 	c.mu.RUnlock()
 	if token == "" {
-		return nil, "", errors.New("client not initialized")
+		return nil, errors.New("client not initialized")
 	}
 	if language == "" {
 		language = "en"
@@ -426,7 +437,7 @@ func (c *Client) readConversationCandidates(ctx context.Context, conversationID 
 	form := url.Values{"at": {token}, "f.req": {string(envelope)}}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, geminiAccountURL(EndpointBatchExec, authUser)+"?"+query.Encode(), strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	for name, value := range DefaultHeaders {
 		request.Header.Set(name, value)
@@ -446,21 +457,20 @@ func (c *Client) readConversationCandidates(ctx context.Context, conversationID 
 		if errors.As(err, &requestErr) {
 			err = requestErr.Err
 		}
-		return nil, "", fmt.Errorf("read conversation request failed: %w", err)
+		return nil, fmt.Errorf("read conversation request failed: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("read conversation failed with HTTP status %d", response.StatusCode)
+		return nil, fmt.Errorf("read conversation failed with HTTP status %d", response.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxConversationReadBytes+1))
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if len(body) > maxConversationReadBytes {
-		return nil, "", errors.New("conversation response is too large")
+		return nil, errors.New("conversation response is too large")
 	}
-	candidates, text := parseConversationCandidates(body)
-	return candidates, text, nil
+	return body, nil
 }
 
 // parseConversationVideos returns the videos and text of the newest reply.
@@ -476,6 +486,39 @@ func parseConversationVideos(body []byte) ([]Video, string) {
 // parseConversationCandidates decodes a batchexecute hNvQHb response. Turns are
 // [[cid,rid], null, userMessage, [candidate…], …] with the newest turn first.
 func parseConversationCandidates(body []byte) ([][]interface{}, string) {
+	var found [][]interface{}
+	text := ""
+	for _, rawTurn := range conversationTurns(body) {
+		turn, _ := rawTurn.([]interface{})
+		if len(turn) < 4 {
+			continue
+		}
+		replies, _ := turn[3].([]interface{})
+		if len(replies) == 0 {
+			continue
+		}
+		candidates, _ := replies[0].([]interface{})
+		for _, rawCandidate := range candidates {
+			candidate, ok := rawCandidate.([]interface{})
+			if !ok {
+				continue
+			}
+			found = append(found, candidate)
+			if text == "" && len(candidate) > 1 {
+				if parts, ok := candidate[1].([]interface{}); ok && len(parts) > 0 {
+					text, _ = parts[0].(string)
+				}
+			}
+		}
+		// Only the newest turn belongs to this generation.
+		return found, text
+	}
+	return found, text
+}
+
+// conversationTurns decodes a batchexecute hNvQHb response into its turns,
+// newest first, across every wrb.fr record in the response.
+func conversationTurns(body []byte) []interface{} {
 	body = bytes.TrimPrefix(bytes.TrimSpace(body), []byte(")]}'"))
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	var records [][]interface{}
@@ -503,42 +546,17 @@ func parseConversationCandidates(body []byte) ([][]interface{}, string) {
 		collect(value)
 	}
 
-	var found [][]interface{}
-	text := ""
+	var turns []interface{}
 	for _, record := range records {
 		raw, _ := record[2].(string)
 		var payload []interface{}
 		if json.Unmarshal([]byte(raw), &payload) != nil || len(payload) == 0 {
 			continue
 		}
-		turns, _ := payload[0].([]interface{})
-		for _, rawTurn := range turns {
-			turn, _ := rawTurn.([]interface{})
-			if len(turn) < 4 {
-				continue
-			}
-			replies, _ := turn[3].([]interface{})
-			if len(replies) == 0 {
-				continue
-			}
-			candidates, _ := replies[0].([]interface{})
-			for _, rawCandidate := range candidates {
-				candidate, ok := rawCandidate.([]interface{})
-				if !ok {
-					continue
-				}
-				found = append(found, candidate)
-				if text == "" && len(candidate) > 1 {
-					if parts, ok := candidate[1].([]interface{}); ok && len(parts) > 0 {
-						text, _ = parts[0].(string)
-					}
-				}
-			}
-			// Only the newest turn belongs to this generation.
-			return found, text
-		}
+		recordTurns, _ := payload[0].([]interface{})
+		turns = append(turns, recordTurns...)
 	}
-	return found, text
+	return turns
 }
 
 func (c *Client) downloadGeneratedVideo(ctx context.Context, rawURL, cookieHeader string) ([]byte, error) {
